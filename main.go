@@ -15,7 +15,7 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		fatalf("Usage: mygithelper <command>\nCommands:\n  get      Clone or pull all repos in all groups\n  update   Update GitHub Actions and create PRs")
+		fatalf("Usage: mygithelper <command>\nCommands:\n  get      Clone or pull all repos in all groups\n  update   Update GitHub Actions and create PRs\n  reset    Hard reset all repos (git reset --hard)")
 	}
 
 	switch os.Args[1] {
@@ -25,6 +25,10 @@ func main() {
 		}
 	case "update":
 		if err := runUpdate(); err != nil {
+			fatalf("%v", err)
+		}
+	case "reset":
+		if err := runReset(); err != nil {
 			fatalf("%v", err)
 		}
 	default:
@@ -360,6 +364,53 @@ func updateRepo(repoDir, repo, goVersion, prevVersion string) error {
 
 	return nil
 }
+
+// --- Reset command ---
+
+func runReset() error {
+	baseDir, err := os.Getwd()
+	if err != nil {
+		return fmt.Errorf("failed to get working directory: %w", err)
+	}
+
+	groupsFile := filepath.Join(baseDir, "myrepogroups.txt")
+	groups, err := readLines(groupsFile)
+	if err != nil {
+		return fmt.Errorf("failed to read groups file %s: %w", groupsFile, err)
+	}
+
+	for _, group := range groups {
+		groupDir := filepath.Join(baseDir, group)
+		reposFile := filepath.Join(baseDir, fmt.Sprintf("myrepogroups.%s.txt", group))
+
+		repos, err := readLines(reposFile)
+		if err != nil {
+			return fmt.Errorf("failed to read repos file %s: %w", reposFile, err)
+		}
+
+		for _, repo := range repos {
+			parts := strings.Split(repo, "/")
+			if len(parts) != 2 {
+				continue
+			}
+			repoName := parts[1]
+			repoDir := filepath.Join(groupDir, repoName)
+
+			if !dirExists(repoDir) {
+				continue
+			}
+
+			fmt.Printf("Resetting %s...\n", repo)
+			if err := gitRun(repoDir, "reset", "--hard"); err != nil {
+				return fmt.Errorf("%s: git reset --hard failed: %w", repo, err)
+			}
+		}
+	}
+
+	return nil
+}
+
+// --- Helpers ---
 
 func getDefaultBranch(repoDir string) (string, error) {
 	// Try to get the default branch from remote
