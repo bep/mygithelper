@@ -1,3 +1,16 @@
 # A list of GitHub repos in this repo group.
+bep/buildpkg
+bep/debounce
+bep/execrpc
+bep/gitmap
+bep/goat
+bep/godartsass
+bep/gojap
+bep/golibtemplate
+bep/gr
+bep/grouter
+bep/hugo
+bep/imagemeta
+bep/killswitch
 bep/lazycache
 bep/simplecobra
