@@ -3,7 +3,7 @@ package main
 import (
 	"bufio"
 	"fmt"
-	"iter"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,16 +15,14 @@ import (
 )
 
 type repo struct {
-	Group    string
-	Path     string
-	Name     string
-	Dir      string
-	GroupDir string
+	Path string // GitHub path (e.g., "bep/firstupdotenv")
+	Name string // Extracted repo name (e.g., "firstupdotenv")
+	Dir  string // Full path on disk
 }
 
 func main() {
 	if len(os.Args) < 2 {
-		fatalf("Usage: mygithelper <command>\nCommands:\n  get      Clone all repos, or checkout default branch for existing\n  update   Update GitHub Actions and create PRs\n  reset    Hard reset, checkout default branch, and pull")
+		fatalf("Usage: mygithelper update\n\nWalks the directory tree and updates all repos found in gitjoin.txt files.")
 	}
 
 	baseDir, err := os.Getwd()
@@ -32,217 +30,20 @@ func main() {
 		fatalf("failed to get working directory: %v", err)
 	}
 
-	cfg := &config{BaseDir: baseDir}
-	if err := cfg.Load(); err != nil {
-		fatalf("%v", err)
-	}
-
-	var cmdErr error
 	switch os.Args[1] {
-	case "get":
-		cmdErr = (&getCmd{config: cfg}).Run()
 	case "update":
-		cmdErr = (&updateCmd{config: cfg}).Run()
-	case "reset":
-		cmdErr = (&resetCmd{config: cfg}).Run()
+		if err := (&updateCmd{BaseDir: baseDir}).Run(); err != nil {
+			fatalf("%v", err)
+		}
 	default:
 		fatalf("Unknown command: %s", os.Args[1])
 	}
-
-	if cmdErr != nil {
-		fatalf("%v", cmdErr)
-	}
-}
-
-type config struct {
-	BaseDir string
-	Groups  []string
-}
-
-func (c *config) Load() error {
-	groupsFile := filepath.Join(c.BaseDir, "myrepogroups.txt")
-	groups, err := readLines(groupsFile)
-	if err != nil {
-		return fmt.Errorf("failed to read groups file %s: %w", groupsFile, err)
-	}
-	c.Groups = groups
-	return nil
-}
-
-func (c *config) ReposFile(group string) string {
-	return filepath.Join(c.BaseDir, fmt.Sprintf("myrepogroups.%s.txt", group))
-}
-
-func (c *config) GroupDir(group string) string {
-	return filepath.Join(c.BaseDir, group)
-}
-
-// Repos returns an iterator over all repos in all groups.
-func (c *config) Repos() iter.Seq[repo] {
-	return func(yield func(repo) bool) {
-		for _, group := range c.Groups {
-			for repo := range c.ReposInGroup(group) {
-				if !yield(repo) {
-					return
-				}
-			}
-		}
-	}
-}
-
-// ReposInGroup returns an iterator over repos in a specific group.
-func (c *config) ReposInGroup(group string) iter.Seq[repo] {
-	return func(yield func(repo) bool) {
-		groupDir := c.GroupDir(group)
-		repos, err := readLines(c.ReposFile(group))
-		if err != nil {
-			return
-		}
-
-		for _, repoPath := range repos {
-			repoName := repoNameFromPath(repoPath)
-			if repoName == "" {
-				continue
-			}
-			r := repo{
-				Group:    group,
-				Path:     repoPath,
-				Name:     repoName,
-				Dir:      filepath.Join(groupDir, repoName),
-				GroupDir: groupDir,
-			}
-			if !yield(r) {
-				return
-			}
-		}
-	}
-}
-
-// --- Get command ---
-
-type getCmd struct {
-	*config
-}
-
-func (cmd *getCmd) Run() error {
-	if len(cmd.Groups) == 0 {
-		return fmt.Errorf("no groups found")
-	}
-
-	for _, group := range cmd.Groups {
-		if err := cmd.processGroup(group); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (cmd *getCmd) processGroup(group string) error {
-	groupDir := cmd.GroupDir(group)
-
-	if err := os.MkdirAll(groupDir, 0o755); err != nil {
-		return fmt.Errorf("failed to create group directory %s: %w", groupDir, err)
-	}
-
-	// Build set of expected repo names and process each repo
-	expectedRepos := make(map[string]bool)
-	repoCount := 0
-	for repo := range cmd.ReposInGroup(group) {
-		expectedRepos[repo.Name] = true
-		repoCount++
-		if err := cmd.processRepo(repo); err != nil {
-			return err
-		}
-	}
-
-	if repoCount == 0 {
-		fmt.Printf("No repos found in group %q, skipping\n", group)
-		return nil
-	}
-
-	// Remove repos that are no longer in the list
-	return cmd.removeStaleRepos(groupDir, expectedRepos)
-}
-
-func (cmd *getCmd) processRepo(repo repo) error {
-	if dirExists(repo.Dir) {
-		return cmd.checkoutDefaultBranch(repo)
-	}
-	return cmd.clone(repo)
-}
-
-func (cmd *getCmd) clone(repo repo) error {
-	repoURL := fmt.Sprintf("git@github.com:%s.git", repo.Path)
-	fmt.Printf("Cloning %s...\n", repo.Path)
-
-	if err := gitRun(repo.GroupDir, "clone", repoURL); err != nil {
-		return fmt.Errorf("failed to clone %s: %w\n\nPlease check:\n  - You have SSH access to GitHub (run: ssh -T git@github.com)\n  - The repository exists and you have access to it", repo.Path, err)
-	}
-	return nil
-}
-
-func (cmd *getCmd) checkoutDefaultBranch(repo repo) error {
-	if dirty, status, err := checkUncommitted(repo.Dir); err != nil {
-		return err
-	} else if dirty {
-		return fmt.Errorf("repo %s has uncommitted changes:\n%s\nPlease commit or stash your changes before running get", repo.Path, status)
-	}
-
-	defaultBranch, err := getDefaultBranch(repo.Dir)
-	if err != nil {
-		return fmt.Errorf("%s: failed to get default branch: %w", repo.Path, err)
-	}
-
-	fmt.Printf("Checking out %s in %s...\n", defaultBranch, repo.Path)
-
-	if err := gitRun(repo.Dir, "checkout", defaultBranch); err != nil {
-		return fmt.Errorf("failed to checkout %s in %s: %w", defaultBranch, repo.Path, err)
-	}
-	return nil
-}
-
-func (cmd *getCmd) removeStaleRepos(groupDir string, expectedRepos map[string]bool) error {
-	entries, err := os.ReadDir(groupDir)
-	if err != nil {
-		return fmt.Errorf("failed to read group directory %s: %w", groupDir, err)
-	}
-
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-
-		repoName := entry.Name()
-		if expectedRepos[repoName] {
-			continue
-		}
-
-		repoDir := filepath.Join(groupDir, repoName)
-
-		// Check if it's a git repo
-		if !dirExists(filepath.Join(repoDir, ".git")) {
-			continue
-		}
-
-		if dirty, status, err := checkUncommitted(repoDir); err != nil {
-			return err
-		} else if dirty {
-			return fmt.Errorf("repo %s is no longer in the list but has uncommitted changes:\n%s\nPlease commit, stash, or manually remove the directory: %s", repoName, status, repoDir)
-		}
-
-		fmt.Printf("Removing %s (no longer in list)...\n", repoName)
-		if err := os.RemoveAll(repoDir); err != nil {
-			return fmt.Errorf("failed to remove %s: %w", repoDir, err)
-		}
-	}
-
-	return nil
 }
 
 // --- Update command ---
 
 type updateCmd struct {
-	*config
+	BaseDir     string
 	GoVersion   string
 	PrevVersion string
 }
@@ -256,26 +57,85 @@ func (cmd *updateCmd) Run() error {
 		return fmt.Errorf("gh (GitHub CLI) is required but not installed.\nInstall: https://cli.github.com/")
 	}
 
-	// Parse Go version from this repo's go.mod
-	goVersion, err := parseGoVersion(cmd.BaseDir)
-	if err != nil {
-		return fmt.Errorf("failed to parse Go version from go.mod: %w", err)
+	// Parse Go version from this repo's go.mod (optional)
+	if goVersion, err := parseGoVersion(cmd.BaseDir); err == nil {
+		cmd.GoVersion = goVersion
+		cmd.PrevVersion = prevGoVersion(goVersion)
+		fmt.Printf("Using Go versions: %s.x (current), %s.x (previous)\n", cmd.GoVersion, cmd.PrevVersion)
+	} else {
+		fmt.Println("No go.mod found in base directory, skipping Go version updates")
 	}
-	cmd.GoVersion = goVersion
-	cmd.PrevVersion = prevGoVersion(goVersion)
 
-	fmt.Printf("Using Go versions: %s.x (current), %s.x (previous)\n", cmd.GoVersion, cmd.PrevVersion)
+	// Find and process all gitjoin.txt files
+	repos, err := cmd.findRepos()
+	if err != nil {
+		return err
+	}
 
-	for repo := range cmd.Repos() {
-		if !dirExists(repo.Dir) {
-			fmt.Printf("Skipping %s: not cloned\n", repo.Path)
-			continue
-		}
+	if len(repos) == 0 {
+		fmt.Println("No repos found in gitjoin.txt files")
+		return nil
+	}
+
+	fmt.Printf("Found %d repos in gitjoin.txt files\n", len(repos))
+
+	for _, repo := range repos {
 		if err := cmd.updateRepo(repo); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func (cmd *updateCmd) findRepos() ([]repo, error) {
+	var repos []repo
+
+	err := filepath.WalkDir(cmd.BaseDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+
+		// Skip .git directories
+		if d.IsDir() && d.Name() == ".git" {
+			return filepath.SkipDir
+		}
+
+		if d.Name() != "gitjoin.txt" {
+			return nil
+		}
+
+		// Found a gitjoin.txt file
+		gitjoinDir := filepath.Dir(path)
+		lines, err := readLines(path)
+		if err != nil {
+			return fmt.Errorf("failed to read %s: %w", path, err)
+		}
+
+		for _, line := range lines {
+			repoPath := repoPathFromGitjoinLine(line)
+			if repoPath == "" {
+				continue
+			}
+			repoName := repoNameFromPath(repoPath)
+			if repoName == "" {
+				continue
+			}
+			repoDir := filepath.Join(gitjoinDir, repoName)
+			if !dirExists(repoDir) {
+				fmt.Printf("Skipping %s: not cloned at %s\n", repoPath, repoDir)
+				continue
+			}
+			repos = append(repos, repo{
+				Path: repoPath,
+				Name: repoName,
+				Dir:  repoDir,
+			})
+		}
+
+		return nil
+	})
+
+	return repos, err
 }
 
 func (cmd *updateCmd) updateRepo(repo repo) error {
@@ -313,16 +173,20 @@ func (cmd *updateCmd) updateRepo(repo repo) error {
 	}
 
 	// Run all update steps
-	if err := cmd.runUpdateSteps(repo.Dir); err != nil {
+	result, err := cmd.runUpdateSteps(repo.Dir)
+	if err != nil {
 		return fmt.Errorf("%s: %w", repo.Path, err)
 	}
 
-	// Build commit message based on actual changes
+	// Build commit message based on what was actually updated
 	var updates []string
-	if testYmlChanged(repo.Dir) {
-		updates = append(updates, fmt.Sprintf("Go %s.x/%s.x, GitHub Actions", cmd.PrevVersion, cmd.GoVersion))
+	if result.UpdatedGoVersions && testYmlChanged(repo.Dir) {
+		updates = append(updates, fmt.Sprintf("Go %s.x/%s.x", cmd.PrevVersion, cmd.GoVersion))
 	}
-	if goModChanged(repo.Dir) {
+	if result.UpdatedGitHubActions && testYmlChanged(repo.Dir) {
+		updates = append(updates, "GitHub Actions")
+	}
+	if result.UpdatedGoMod && goModChanged(repo.Dir) {
 		updates = append(updates, fmt.Sprintf("go.mod Go %s, dependencies", cmd.PrevVersion))
 	}
 
@@ -357,40 +221,51 @@ func (cmd *updateCmd) updateRepo(repo repo) error {
 	return nil
 }
 
-func (cmd *updateCmd) runUpdateSteps(repoDir string) error {
-	// Step 1: Update test.yml with Go versions (optional - file may not exist)
-	if hasTestYml(repoDir) {
+type updateResult struct {
+	UpdatedGoVersions    bool
+	UpdatedGitHubActions bool
+	UpdatedGoMod         bool
+}
+
+func (cmd *updateCmd) runUpdateSteps(repoDir string) (updateResult, error) {
+	var result updateResult
+
+	// Step 1: Update test.yml with Go versions (optional - requires file and Go version config)
+	if cmd.GoVersion != "" && hasTestYml(repoDir) {
 		fmt.Println("Updating test.yml...")
 		if _, _, err := cmd.updateTestYml(repoDir); err != nil {
-			return fmt.Errorf("failed to update test.yml: %w", err)
+			return result, fmt.Errorf("failed to update test.yml: %w", err)
 		}
+		result.UpdatedGoVersions = true
 	}
 
 	// Step 2: Run ghat on .github/workflows (optional - directory may not exist)
 	if hasWorkflowsDir(repoDir) {
 		fmt.Println("Running ghat swot...")
 		if err := runGhat(repoDir); err != nil {
-			return fmt.Errorf("ghat failed: %w", err)
+			return result, fmt.Errorf("ghat failed: %w", err)
 		}
+		result.UpdatedGitHubActions = true
 	}
 
-	// Step 3: Update Go version in go.mod (optional - go.mod may not exist)
-	if hasGoMod(repoDir) {
+	// Step 3: Update Go version in go.mod (optional - requires go.mod and Go version config)
+	if cmd.GoVersion != "" && hasGoMod(repoDir) {
 		fmt.Printf("Setting go.mod version to %s...\n", cmd.PrevVersion)
 		if err := goRun(repoDir, "mod", "edit", "-go", cmd.PrevVersion); err != nil {
-			return fmt.Errorf("go mod edit failed: %w", err)
+			return result, fmt.Errorf("go mod edit failed: %w", err)
 		}
+		result.UpdatedGoMod = true
 	}
 
-	// Step 4: Update dependencies (optional - go.mod may not exist)
-	if hasGoMod(repoDir) {
+	// Step 4: Update dependencies (optional - requires go.mod and Go version config)
+	if cmd.GoVersion != "" && hasGoMod(repoDir) {
 		fmt.Println("Updating dependencies...")
 		if err := goRun(repoDir, "get", "-t", "-u", "./..."); err != nil {
-			return fmt.Errorf("go get failed: %w", err)
+			return result, fmt.Errorf("go get failed: %w", err)
 		}
 	}
 
-	return nil
+	return result, nil
 }
 
 func (cmd *updateCmd) generateBranchName(repoDir string) (string, error) {
@@ -472,43 +347,21 @@ func (cmd *updateCmd) updateTestYml(repoDir string) (newContent []byte, updated 
 	return newContent, true, nil
 }
 
-// --- Reset command ---
-
-type resetCmd struct {
-	*config
-}
-
-func (cmd *resetCmd) Run() error {
-	for repo := range cmd.Repos() {
-		if !dirExists(repo.Dir) {
-			continue
-		}
-		fmt.Printf("Resetting %s...\n", repo.Path)
-		if err := gitRun(repo.Dir, "reset", "--hard"); err != nil {
-			return fmt.Errorf("%s: git reset --hard failed: %w", repo.Path, err)
-		}
-
-		// Checkout default branch
-		defaultBranch, err := getDefaultBranch(repo.Dir)
-		if err != nil {
-			return fmt.Errorf("%s: failed to get default branch: %w", repo.Path, err)
-		}
-		if err := gitRun(repo.Dir, "checkout", defaultBranch); err != nil {
-			return fmt.Errorf("%s: failed to checkout %s: %w", repo.Path, defaultBranch, err)
-		}
-
-		// Pull upstream
-		if err := gitRun(repo.Dir, "pull"); err != nil {
-			return fmt.Errorf("%s: git pull failed: %w", repo.Path, err)
-		}
-	}
-	return nil
-}
-
 // --- Helpers ---
 
-func repoNameFromPath(repo string) string {
-	parts := strings.Split(repo, "/")
+// repoPathFromGitjoinLine extracts the GitHub repo path from a gitjoin.txt line.
+// Input: "github.com/bep/firstupdotenv" -> Output: "bep/firstupdotenv"
+func repoPathFromGitjoinLine(line string) string {
+	line = strings.TrimPrefix(line, "github.com/")
+	parts := strings.Split(line, "/")
+	if len(parts) != 2 {
+		return ""
+	}
+	return line
+}
+
+func repoNameFromPath(repoPath string) string {
+	parts := strings.Split(repoPath, "/")
 	if len(parts) != 2 {
 		return ""
 	}

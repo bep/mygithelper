@@ -31,5 +31,9 @@ go.work.sum
 # .idea/
 # .vscode/
 
-go/
+gocode/
 mygithelper
+
+# Managed by gitjoin - do not edit this section
+gocode/firstupdotenv/
+# End gitjoin managed section
