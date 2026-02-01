@@ -22,7 +22,7 @@ type repo struct {
 
 func main() {
 	if len(os.Args) < 2 {
-		fatalf("Usage: mygithelper update\n\nWalks the directory tree and updates all repos found in gitjoin.txt files.")
+		fatalf("Usage: mygithelper update [--force]\n\nWalks the directory tree and updates all repos found in gitjoin.txt files.\n\nFlags:\n  --force  Create PR even with only 1 update (default requires at least 2)")
 	}
 
 	baseDir, err := os.Getwd()
@@ -32,7 +32,8 @@ func main() {
 
 	switch os.Args[1] {
 	case "update":
-		if err := (&updateCmd{BaseDir: baseDir}).Run(); err != nil {
+		force := len(os.Args) > 2 && os.Args[2] == "--force"
+		if err := (&updateCmd{BaseDir: baseDir, Force: force}).Run(); err != nil {
 			fatalf("%v", err)
 		}
 	default:
@@ -46,6 +47,7 @@ type updateCmd struct {
 	BaseDir     string
 	GoVersion   string
 	PrevVersion string
+	Force       bool
 }
 
 func (cmd *updateCmd) Run() error {
@@ -192,6 +194,15 @@ func (cmd *updateCmd) updateRepo(repo repo) error {
 
 	if len(updates) == 0 {
 		fmt.Println("No changes to commit")
+		return nil
+	}
+
+	// Require at least 2 updates unless --force is used
+	if len(updates) < 2 && !cmd.Force {
+		fmt.Printf("Only %d update(s), skipping PR (use --force to override)\n", len(updates))
+		if err := gitRun(repo.Dir, "checkout", "."); err != nil {
+			return fmt.Errorf("%s: failed to revert changes: %w", repo.Path, err)
+		}
 		return nil
 	}
 
