@@ -248,11 +248,11 @@ type updateCmd struct {
 }
 
 func (cmd *updateCmd) Run() error {
-	// Check dependencies
-	if _, err := exec.LookPath("ghat"); err != nil {
+	// Check dependencies (use shell to resolve aliases)
+	if err := shellCommandExists("ghat"); err != nil {
 		return fmt.Errorf("ghat is required but not installed.\nInstall: go install github.com/JamesWoolfenden/ghat@latest")
 	}
-	if _, err := exec.LookPath("gh"); err != nil {
+	if err := shellCommandExists("gh"); err != nil {
 		return fmt.Errorf("gh (GitHub CLI) is required but not installed.\nInstall: https://cli.github.com/")
 	}
 
@@ -572,11 +572,7 @@ func branchExistsRemote(repoDir, branch string) bool {
 }
 
 func runGhat(repoDir string) error {
-	cmd := exec.Command("ghat", "swot", "-d", ".")
-	cmd.Dir = repoDir
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	return shellRun(repoDir, "ghat swot -d .")
 }
 
 func goRun(dir string, args ...string) error {
@@ -604,11 +600,10 @@ func testYmlChanged(repoDir string) bool {
 }
 
 func createPR(repoDir, title, body string) error {
-	cmd := exec.Command("gh", "pr", "create", "--title", title, "--body", body)
-	cmd.Dir = repoDir
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	// Escape single quotes in title and body for shell
+	escapedTitle := strings.ReplaceAll(title, "'", "'\"'\"'")
+	escapedBody := strings.ReplaceAll(body, "'", "'\"'\"'")
+	return shellRun(repoDir, fmt.Sprintf("gh pr create --title '%s' --body '%s'", escapedTitle, escapedBody))
 }
 
 // --- Git helpers ---
@@ -680,4 +675,28 @@ func hasGoMod(repoDir string) bool {
 func fatalf(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, format+"\n", args...)
 	os.Exit(1)
+}
+
+// --- Shell helpers (for alias support) ---
+
+func getShell() string {
+	if shell := os.Getenv("SHELL"); shell != "" {
+		return shell
+	}
+	return "bash"
+}
+
+func shellCommandExists(command string) error {
+	shell := getShell()
+	cmd := exec.Command(shell, "-ic", "command -v "+command)
+	return cmd.Run()
+}
+
+func shellRun(dir, command string) error {
+	shell := getShell()
+	cmd := exec.Command(shell, "-ic", command)
+	cmd.Dir = dir
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
 }
