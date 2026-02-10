@@ -22,7 +22,7 @@ type repo struct {
 
 func main() {
 	if len(os.Args) < 2 {
-		fatalf("Usage: mygithelper update [--force]\n\nWalks the directory tree and updates all repos found in gitjoin.txt files.\n\nFlags:\n  --force  Create PR even with only 1 update (default requires at least 2)")
+		fatalf("Usage: mygithelper <command>\n\nCommands:\n  update [--force]  Update Go versions, GitHub Actions, and dependencies\n  fix               Run modernize -fix on all repos")
 	}
 
 	baseDir, err := os.Getwd()
@@ -34,6 +34,10 @@ func main() {
 	case "update":
 		force := len(os.Args) > 2 && os.Args[2] == "--force"
 		if err := (&updateCmd{BaseDir: baseDir, Force: force}).Run(); err != nil {
+			fatalf("%v", err)
+		}
+	case "fix":
+		if err := (&fixCmd{BaseDir: baseDir}).Run(); err != nil {
 			fatalf("%v", err)
 		}
 	default:
@@ -356,6 +360,206 @@ func (cmd *updateCmd) updateTestYml(repoDir string) (newContent []byte, updated 
 	}
 
 	return newContent, true, nil
+}
+
+// --- Fix command ---
+
+type fixCmd struct {
+	BaseDir string
+}
+
+func (cmd *fixCmd) Run() error {
+	if err := shellCommandExists("gh"); err != nil {
+		return fmt.Errorf("gh (GitHub CLI) is required but not installed.\nInstall: https://cli.github.com/")
+	}
+
+	repos, err := cmd.findRepos()
+	if err != nil {
+		return err
+	}
+
+	if len(repos) == 0 {
+		fmt.Println("No repos found in gitjoin.txt files")
+		return nil
+	}
+
+	fmt.Printf("Found %d repos in gitjoin.txt files\n", len(repos))
+
+	for _, repo := range repos {
+		if err := cmd.fixRepo(repo); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (cmd *fixCmd) findRepos() ([]repo, error) {
+	var repos []repo
+
+	err := filepath.WalkDir(cmd.BaseDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+
+		if d.IsDir() && d.Name() == ".git" {
+			return filepath.SkipDir
+		}
+
+		if d.Name() != "gitjoin.txt" {
+			return nil
+		}
+
+		gitjoinDir := filepath.Dir(path)
+		lines, err := readLines(path)
+		if err != nil {
+			return fmt.Errorf("failed to read %s: %w", path, err)
+		}
+
+		for _, line := range lines {
+			repoPath := repoPathFromGitjoinLine(line)
+			if repoPath == "" {
+				continue
+			}
+			repoName := repoNameFromPath(repoPath)
+			if repoName == "" {
+				continue
+			}
+			repoDir := filepath.Join(gitjoinDir, repoName)
+			if !dirExists(repoDir) {
+				fmt.Printf("Skipping %s: not cloned at %s\n", repoPath, repoDir)
+				continue
+			}
+			repos = append(repos, repo{
+				Path: repoPath,
+				Name: repoName,
+				Dir:  repoDir,
+			})
+		}
+
+		return nil
+	})
+
+	return repos, err
+}
+
+func (cmd *fixCmd) fixRepo(repo repo) error {
+	fmt.Printf("\n=== Fixing %s ===\n", repo.Path)
+
+	if !hasGoMod(repo.Dir) {
+		fmt.Println("No go.mod, skipping")
+		return nil
+	}
+
+	// Check for uncommitted changes
+	if dirty, status, err := checkUncommitted(repo.Dir); err != nil {
+		return err
+	} else if dirty {
+		return fmt.Errorf("repo %s has uncommitted changes:\n%s\nPlease commit or stash your changes", repo.Path, status)
+	}
+
+	// Get default branch and ensure we're on it
+	defaultBranch, err := getDefaultBranch(repo.Dir)
+	if err != nil {
+		return fmt.Errorf("%s: failed to get default branch: %w", repo.Path, err)
+	}
+
+	currentBranch, err := gitOutput(repo.Dir, "rev-parse", "--abbrev-ref", "HEAD")
+	if err != nil {
+		return fmt.Errorf("%s: failed to get current branch: %w", repo.Path, err)
+	}
+	currentBranch = strings.TrimSpace(currentBranch)
+
+	if currentBranch != defaultBranch {
+		fmt.Printf("Switching to %s...\n", defaultBranch)
+		if err := gitRun(repo.Dir, "checkout", defaultBranch); err != nil {
+			return fmt.Errorf("%s: failed to checkout %s: %w", repo.Path, defaultBranch, err)
+		}
+	}
+
+	// Pull latest
+	if err := gitRun(repo.Dir, "pull"); err != nil {
+		return fmt.Errorf("%s: failed to pull: %w", repo.Path, err)
+	}
+
+	// Run modernize -fix
+	fmt.Println("Running modernize -fix...")
+	if err := goRun(repo.Dir, "run", "golang.org/x/tools/go/analysis/passes/modernize/cmd/modernize@latest", "-fix", "./..."); err != nil {
+		return fmt.Errorf("%s: modernize failed: %w", repo.Path, err)
+	}
+
+	// Check for changes
+	if dirty, _, err := checkUncommitted(repo.Dir); err != nil {
+		return err
+	} else if !dirty {
+		fmt.Println("No changes from modernize")
+		return nil
+	}
+
+	// Generate branch name from diff hash
+	branchName, err := cmd.generateBranchName(repo.Dir)
+	if err != nil {
+		return fmt.Errorf("%s: %w", repo.Path, err)
+	}
+
+	// Check if branch already exists remotely
+	if branchExistsRemote(repo.Dir, branchName) {
+		fmt.Printf("Branch %s already exists, skipping\n", branchName)
+		if err := gitRun(repo.Dir, "checkout", "."); err != nil {
+			return fmt.Errorf("%s: failed to revert changes: %w", repo.Path, err)
+		}
+		return nil
+	}
+
+	commitMsg := "all: Run modernize -fix ./..."
+	prBody := commitMsg + "\n\n---\nCreated by mygithelper"
+
+	if err := cmd.createPR(repo.Dir, defaultBranch, branchName, commitMsg, prBody); err != nil {
+		return fmt.Errorf("%s: %w", repo.Path, err)
+	}
+
+	return nil
+}
+
+func (cmd *fixCmd) generateBranchName(repoDir string) (string, error) {
+	h := xxhash.New()
+
+	output, err := gitOutput(repoDir, "diff")
+	if err != nil {
+		return "", err
+	}
+	h.Write([]byte(output))
+
+	return fmt.Sprintf("mygithelper/fix-%x", h.Sum64()), nil
+}
+
+func (cmd *fixCmd) createPR(repoDir, defaultBranch, branchName, commitMsg, prBody string) error {
+	if err := gitRun(repoDir, "checkout", "-b", branchName); err != nil {
+		return fmt.Errorf("failed to create branch: %w", err)
+	}
+
+	if err := gitRun(repoDir, "add", "-A"); err != nil {
+		return fmt.Errorf("failed to stage changes: %w", err)
+	}
+
+	if err := gitRun(repoDir, "commit", "-m", commitMsg); err != nil {
+		return fmt.Errorf("failed to commit: %w", err)
+	}
+
+	fmt.Printf("Pushing branch %s...\n", branchName)
+	if err := gitRun(repoDir, "push", "-u", "origin", branchName); err != nil {
+		return fmt.Errorf("failed to push: %w", err)
+	}
+
+	fmt.Println("Creating PR...")
+	if err := createPR(repoDir, commitMsg, prBody); err != nil {
+		return fmt.Errorf("failed to create PR: %w", err)
+	}
+
+	if err := gitRun(repoDir, "checkout", defaultBranch); err != nil {
+		return fmt.Errorf("failed to checkout %s: %w", defaultBranch, err)
+	}
+
+	return nil
 }
 
 // --- Helpers ---
