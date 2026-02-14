@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 
@@ -63,13 +64,13 @@ func (cmd *updateCmd) Run() error {
 		return fmt.Errorf("gh (GitHub CLI) is required but not installed.\nInstall: https://cli.github.com/")
 	}
 
-	// Parse Go version from this repo's go.mod (optional)
-	if goVersion, err := parseGoVersion(cmd.BaseDir); err == nil {
-		cmd.GoVersion = goVersion
-		cmd.PrevVersion = prevGoVersion(goVersion)
-		fmt.Printf("Using Go versions: %s.x (current), %s.x (previous)\n", cmd.GoVersion, cmd.PrevVersion)
+	// Derive Go versions from the running Go binary (current = running - 1, previous = running - 2)
+	if goVersion, err := runningGoVersion(); err == nil {
+		cmd.GoVersion = prevGoVersion(goVersion)
+		cmd.PrevVersion = prevGoVersion(cmd.GoVersion)
+		fmt.Printf("Using Go versions: %s.x (current), %s.x (previous) [running Go %s]\n", cmd.GoVersion, cmd.PrevVersion, goVersion)
 	} else {
-		fmt.Println("No go.mod found in base directory, skipping Go version updates")
+		fmt.Printf("Could not determine running Go version: %v\n", err)
 	}
 
 	// Find and process all gitjoin.txt files
@@ -193,7 +194,7 @@ func (cmd *updateCmd) updateRepo(repo repo) error {
 		updates = append(updates, "GitHub Actions")
 	}
 	if result.UpdatedGoMod && goModChanged(repo.Dir) {
-		updates = append(updates, fmt.Sprintf("go.mod Go %s, dependencies", cmd.PrevVersion))
+		updates = append(updates, fmt.Sprintf("go.mod Go %s, dependencies", cmd.GoVersion))
 	}
 
 	if len(updates) == 0 {
@@ -251,25 +252,26 @@ func (cmd *updateCmd) runUpdateSteps(repoDir string) (updateResult, error) {
 		if _, _, err := cmd.updateTestYml(repoDir); err != nil {
 			return result, fmt.Errorf("failed to update test.yml: %w", err)
 		}
-		result.UpdatedGoVersions = true
+		result.UpdatedGoVersions = testYmlChanged(repoDir)
 	}
 
 	// Step 2: Run ghat on .github/workflows (optional - directory may not exist)
+	testYmlBeforeGhat := readFileOrEmpty(filepath.Join(repoDir, ".github", "workflows", "test.yml"))
 	if hasWorkflowsDir(repoDir) {
 		fmt.Println("Running ghat swot...")
 		if err := runGhat(repoDir); err != nil {
 			return result, fmt.Errorf("ghat failed: %w", err)
 		}
-		result.UpdatedGitHubActions = true
+		testYmlAfterGhat := readFileOrEmpty(filepath.Join(repoDir, ".github", "workflows", "test.yml"))
+		result.UpdatedGitHubActions = testYmlAfterGhat != testYmlBeforeGhat
 	}
 
 	// Step 3: Update Go version in go.mod (optional - requires go.mod and Go version config)
 	if cmd.GoVersion != "" && hasGoMod(repoDir) {
-		fmt.Printf("Setting go.mod version to %s...\n", cmd.PrevVersion)
-		if err := goRun(repoDir, "mod", "edit", "-go", cmd.PrevVersion); err != nil {
+		fmt.Printf("Setting go.mod version to %s...\n", cmd.GoVersion)
+		if err := goRun(repoDir, "mod", "edit", "-go", cmd.GoVersion); err != nil {
 			return result, fmt.Errorf("go mod edit failed: %w", err)
 		}
-		result.UpdatedGoMod = true
 	}
 
 	// Step 4: Update dependencies (optional - requires go.mod and Go version config)
@@ -279,6 +281,8 @@ func (cmd *updateCmd) runUpdateSteps(repoDir string) (updateResult, error) {
 			return result, fmt.Errorf("go get failed: %w", err)
 		}
 	}
+
+	result.UpdatedGoMod = goModChanged(repoDir)
 
 	return result, nil
 }
@@ -601,20 +605,14 @@ func getDefaultBranch(repoDir string) (string, error) {
 	return "main", nil
 }
 
-func parseGoVersion(repoDir string) (string, error) {
-	goModPath := filepath.Join(repoDir, "go.mod")
-	content, err := os.ReadFile(goModPath)
-	if err != nil {
-		return "", fmt.Errorf("no go.mod found")
+func runningGoVersion() (string, error) {
+	// runtime.Version() returns e.g. "go1.26.0"
+	v := strings.TrimPrefix(runtime.Version(), "go")
+	parts := strings.Split(v, ".")
+	if len(parts) < 2 {
+		return "", fmt.Errorf("unexpected go version format: %s", v)
 	}
-
-	re := regexp.MustCompile(`(?m)^go\s+(\d+\.\d+)`)
-	matches := re.FindSubmatch(content)
-	if matches == nil {
-		return "", fmt.Errorf("no go version found in go.mod")
-	}
-
-	return string(matches[1]), nil
+	return parts[0] + "." + parts[1], nil
 }
 
 func prevGoVersion(version string) string {
@@ -665,6 +663,14 @@ func testYmlChanged(repoDir string) bool {
 		return false
 	}
 	return strings.TrimSpace(output) != ""
+}
+
+func readFileOrEmpty(filename string) string {
+	b, err := os.ReadFile(filename)
+	if err != nil {
+		return ""
+	}
+	return string(b)
 }
 
 func createPR(repoDir, title, body string) error {
