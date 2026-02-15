@@ -23,7 +23,7 @@ type repo struct {
 
 func main() {
 	if len(os.Args) < 2 {
-		fatalf("Usage: mygithelper <command>\n\nCommands:\n  update [--force]  Update Go versions, GitHub Actions, and dependencies\n  fix               Run modernize -fix on all repos")
+		fatalf("Usage: mygithelper <command>\n\nCommands:\n  update [--force] [--try]  Update Go versions, GitHub Actions, and dependencies\n  fix [--try]               Run modernize -fix on all repos\n\nFlags:\n  --try    Dry-run: show what would change without creating branches or PRs")
 	}
 
 	baseDir, err := os.Getwd()
@@ -31,14 +31,24 @@ func main() {
 		fatalf("failed to get working directory: %v", err)
 	}
 
+	// Parse flags from remaining args
+	var force, try bool
+	for _, arg := range os.Args[2:] {
+		switch arg {
+		case "--force":
+			force = true
+		case "--try":
+			try = true
+		}
+	}
+
 	switch os.Args[1] {
 	case "update":
-		force := len(os.Args) > 2 && os.Args[2] == "--force"
-		if err := (&updateCmd{BaseDir: baseDir, Force: force}).Run(); err != nil {
+		if err := (&updateCmd{BaseDir: baseDir, Force: force, Try: try}).Run(); err != nil {
 			fatalf("%v", err)
 		}
 	case "fix":
-		if err := (&fixCmd{BaseDir: baseDir}).Run(); err != nil {
+		if err := (&fixCmd{BaseDir: baseDir, Try: try}).Run(); err != nil {
 			fatalf("%v", err)
 		}
 	default:
@@ -53,6 +63,7 @@ type updateCmd struct {
 	GoVersion   string
 	PrevVersion string
 	Force       bool
+	Try         bool
 }
 
 func (cmd *updateCmd) Run() error {
@@ -199,6 +210,17 @@ func (cmd *updateCmd) updateRepo(repo repo) error {
 
 	if len(updates) == 0 {
 		fmt.Println("No changes to commit")
+		return nil
+	}
+
+	// Dry-run: show what would be done and revert
+	if cmd.Try {
+		commitMsg := "Update " + strings.Join(updates, ", ")
+		fmt.Printf("[dry-run] Would commit: %s\n", commitMsg)
+		fmt.Printf("[dry-run] Would create PR: %s\n", commitMsg)
+		if err := gitRun(repo.Dir, "checkout", "."); err != nil {
+			return fmt.Errorf("%s: failed to revert changes: %w", repo.Path, err)
+		}
 		return nil
 	}
 
@@ -370,6 +392,7 @@ func (cmd *updateCmd) updateTestYml(repoDir string) (newContent []byte, updated 
 
 type fixCmd struct {
 	BaseDir string
+	Try     bool
 }
 
 func (cmd *fixCmd) Run() error {
@@ -496,6 +519,16 @@ func (cmd *fixCmd) fixRepo(repo repo) error {
 		return err
 	} else if !dirty {
 		fmt.Println("No changes from modernize")
+		return nil
+	}
+
+	// Dry-run: show what would be done and revert
+	if cmd.Try {
+		fmt.Println("[dry-run] Would commit: all: Run modernize -fix ./...")
+		fmt.Println("[dry-run] Would create PR: all: Run modernize -fix ./...")
+		if err := gitRun(repo.Dir, "checkout", "."); err != nil {
+			return fmt.Errorf("%s: failed to revert changes: %w", repo.Path, err)
+		}
 		return nil
 	}
 
