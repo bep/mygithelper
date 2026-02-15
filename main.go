@@ -75,9 +75,9 @@ func (cmd *updateCmd) Run() error {
 		return fmt.Errorf("gh (GitHub CLI) is required but not installed.\nInstall: https://cli.github.com/")
 	}
 
-	// Derive Go versions from the running Go binary (current = running - 1, previous = running - 2)
+	// Derive Go versions from the running Go binary (current = running, previous = running - 1)
 	if goVersion, err := runningGoVersion(); err == nil {
-		cmd.GoVersion = prevGoVersion(goVersion)
+		cmd.GoVersion = goVersion
 		cmd.PrevVersion = prevGoVersion(cmd.GoVersion)
 		fmt.Printf("Using Go versions: %s.x (current), %s.x (previous) [running Go %s]\n", cmd.GoVersion, cmd.PrevVersion, goVersion)
 	} else {
@@ -205,7 +205,7 @@ func (cmd *updateCmd) updateRepo(repo repo) error {
 		updates = append(updates, "GitHub Actions")
 	}
 	if result.UpdatedGoMod && goModChanged(repo.Dir) {
-		updates = append(updates, fmt.Sprintf("go.mod Go %s, dependencies", cmd.GoVersion))
+		updates = append(updates, fmt.Sprintf("go.mod Go %s, dependencies", cmd.PrevVersion))
 	}
 
 	if len(updates) == 0 {
@@ -290,8 +290,9 @@ func (cmd *updateCmd) runUpdateSteps(repoDir string) (updateResult, error) {
 
 	// Step 3: Update Go version in go.mod (optional - requires go.mod and Go version config)
 	if cmd.GoVersion != "" && hasGoMod(repoDir) {
-		fmt.Printf("Setting go.mod version to %s...\n", cmd.GoVersion)
-		if err := goRun(repoDir, "mod", "edit", "-go", cmd.GoVersion); err != nil {
+		goModVersion := cmd.PrevVersion
+		fmt.Printf("Setting go.mod version to %s...\n", goModVersion)
+		if err := goRun(repoDir, "mod", "edit", "-go", goModVersion); err != nil {
 			return result, fmt.Errorf("go mod edit failed: %w", err)
 		}
 	}
