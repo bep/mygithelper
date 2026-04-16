@@ -672,7 +672,7 @@ func branchExistsRemote(repoDir, branch string) bool {
 }
 
 func runGhat(repoDir string) error {
-	return shellRun(repoDir, "ghat swot -d .")
+	return shellRun(repoDir, "ghat swot -s 7 -d .")
 }
 
 func goRun(dir string, args ...string) error {
