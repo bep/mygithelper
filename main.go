@@ -467,6 +467,17 @@ func (cmd *fixCmd) findRepos() ([]repo, error) {
 		return nil
 	})
 
+	if len(repos) == 0 {
+		// Check if curren t directory is a git repo with go.mod
+		if hasGoMod(cmd.BaseDir) {
+			repos = append(repos, repo{
+				Path: cmd.BaseDir,
+				Name: filepath.Base(cmd.BaseDir),
+				Dir:  cmd.BaseDir,
+			})
+		}
+	}
+
 	return repos, err
 }
 
