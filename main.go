@@ -8,7 +8,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"strconv"
 	"strings"
 
@@ -651,8 +650,14 @@ func getDefaultBranch(repoDir string) (string, error) {
 }
 
 func runningGoVersion() (string, error) {
-	// runtime.Version() returns e.g. "go1.26.0"
-	v := strings.TrimPrefix(runtime.Version(), "go")
+	// Ask the go binary that the update steps will invoke; runtime.Version()
+	// would report the toolchain mygithelper was built with.
+	out, err := exec.Command("go", "env", "GOVERSION").Output()
+	if err != nil {
+		return "", fmt.Errorf("go env GOVERSION: %w", err)
+	}
+	// e.g. "go1.27.0"
+	v := strings.TrimPrefix(strings.TrimSpace(string(out)), "go")
 	parts := strings.Split(v, ".")
 	if len(parts) < 2 {
 		return "", fmt.Errorf("unexpected go version format: %s", v)
