@@ -84,7 +84,7 @@ func (cmd *updateCmd) Run() error {
 	}
 
 	// Find and process all gitjoin.txt files
-	repos, err := cmd.findRepos()
+	repos, err := findRepos(cmd.BaseDir)
 	if err != nil {
 		return err
 	}
@@ -94,7 +94,7 @@ func (cmd *updateCmd) Run() error {
 		return nil
 	}
 
-	fmt.Printf("Found %d repos in gitjoin.txt files\n", len(repos))
+	fmt.Printf("Found %d repos\n", len(repos))
 
 	for _, repo := range repos {
 		if err := cmd.updateRepo(repo); err != nil {
@@ -102,57 +102,6 @@ func (cmd *updateCmd) Run() error {
 		}
 	}
 	return nil
-}
-
-func (cmd *updateCmd) findRepos() ([]repo, error) {
-	var repos []repo
-
-	err := filepath.WalkDir(cmd.BaseDir, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-
-		// Skip .git directories
-		if d.IsDir() && d.Name() == ".git" {
-			return filepath.SkipDir
-		}
-
-		if d.Name() != "gitjoin.txt" {
-			return nil
-		}
-
-		// Found a gitjoin.txt file
-		gitjoinDir := filepath.Dir(path)
-		lines, err := readLines(path)
-		if err != nil {
-			return fmt.Errorf("failed to read %s: %w", path, err)
-		}
-
-		for _, line := range lines {
-			repoPath := repoPathFromGitjoinLine(line)
-			if repoPath == "" {
-				continue
-			}
-			repoName := repoNameFromPath(repoPath)
-			if repoName == "" {
-				continue
-			}
-			repoDir := filepath.Join(gitjoinDir, repoName)
-			if !dirExists(repoDir) {
-				fmt.Printf("Skipping %s: not cloned at %s\n", repoPath, repoDir)
-				continue
-			}
-			repos = append(repos, repo{
-				Path: repoPath,
-				Name: repoName,
-				Dir:  repoDir,
-			})
-		}
-
-		return nil
-	})
-
-	return repos, err
 }
 
 func (cmd *updateCmd) updateRepo(repo repo) error {
@@ -287,20 +236,20 @@ func (cmd *updateCmd) runUpdateSteps(repoDir string) (updateResult, error) {
 		result.UpdatedGitHubActions = testYmlAfterGhat != testYmlBeforeGhat
 	}
 
-	// Step 3: Update Go version in go.mod (optional - requires go.mod and Go version config)
-	if cmd.GoVersion != "" && hasGoMod(repoDir) {
+	// Steps 3 and 4: Update Go version in go.mod and dependencies, per module dir
+	// (optional - requires go.mod and Go version config)
+	if cmd.GoVersion != "" {
 		goModVersion := cmd.PrevVersion
-		fmt.Printf("Setting go.mod version to %s...\n", goModVersion)
-		if err := goRun(repoDir, "mod", "edit", "-go", goModVersion); err != nil {
-			return result, fmt.Errorf("go mod edit failed: %w", err)
-		}
-	}
+		for _, dir := range goModDirs(repoDir) {
+			fmt.Printf("Setting %s version to %s...\n", filepath.Join(dir, "go.mod"), goModVersion)
+			if err := goRun(dir, "mod", "edit", "-go", goModVersion); err != nil {
+				return result, fmt.Errorf("go mod edit failed: %w", err)
+			}
 
-	// Step 4: Update dependencies (optional - requires go.mod and Go version config)
-	if cmd.GoVersion != "" && hasGoMod(repoDir) {
-		fmt.Println("Updating dependencies...")
-		if err := goRun(repoDir, "get", "-t", "-u", "./..."); err != nil {
-			return result, fmt.Errorf("go get failed: %w", err)
+			fmt.Println("Updating dependencies...")
+			if err := goRun(dir, "get", "-t", "-u", "./..."); err != nil {
+				return result, fmt.Errorf("go get failed: %w", err)
+			}
 		}
 	}
 
@@ -321,13 +270,15 @@ func (cmd *updateCmd) generateBranchName(repoDir string) (string, error) {
 		h.Write(content)
 	}
 
-	// Hash go.mod if changed
+	// Hash go.mod files if changed
 	if goModChanged(repoDir) {
-		content, err := os.ReadFile(filepath.Join(repoDir, "go.mod"))
-		if err != nil {
-			return "", err
+		for _, dir := range goModDirs(repoDir) {
+			content, err := os.ReadFile(filepath.Join(dir, "go.mod"))
+			if err != nil {
+				return "", err
+			}
+			h.Write(content)
 		}
-		h.Write(content)
 	}
 
 	return fmt.Sprintf("mygithelper/update-%x", h.Sum64()), nil
@@ -400,7 +351,7 @@ func (cmd *fixCmd) Run() error {
 		return fmt.Errorf("gh (GitHub CLI) is required but not installed.\nInstall: https://cli.github.com/")
 	}
 
-	repos, err := cmd.findRepos()
+	repos, err := findRepos(cmd.BaseDir)
 	if err != nil {
 		return err
 	}
@@ -410,7 +361,7 @@ func (cmd *fixCmd) Run() error {
 		return nil
 	}
 
-	fmt.Printf("Found %d repos in gitjoin.txt files\n", len(repos))
+	fmt.Printf("Found %d repos\n", len(repos))
 
 	for _, repo := range repos {
 		if err := cmd.fixRepo(repo); err != nil {
@@ -420,70 +371,11 @@ func (cmd *fixCmd) Run() error {
 	return nil
 }
 
-func (cmd *fixCmd) findRepos() ([]repo, error) {
-	var repos []repo
-
-	err := filepath.WalkDir(cmd.BaseDir, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-
-		if d.IsDir() && d.Name() == ".git" {
-			return filepath.SkipDir
-		}
-
-		if d.Name() != "gitjoin.txt" {
-			return nil
-		}
-
-		gitjoinDir := filepath.Dir(path)
-		lines, err := readLines(path)
-		if err != nil {
-			return fmt.Errorf("failed to read %s: %w", path, err)
-		}
-
-		for _, line := range lines {
-			repoPath := repoPathFromGitjoinLine(line)
-			if repoPath == "" {
-				continue
-			}
-			repoName := repoNameFromPath(repoPath)
-			if repoName == "" {
-				continue
-			}
-			repoDir := filepath.Join(gitjoinDir, repoName)
-			if !dirExists(repoDir) {
-				fmt.Printf("Skipping %s: not cloned at %s\n", repoPath, repoDir)
-				continue
-			}
-			repos = append(repos, repo{
-				Path: repoPath,
-				Name: repoName,
-				Dir:  repoDir,
-			})
-		}
-
-		return nil
-	})
-
-	if len(repos) == 0 {
-		// Check if curren t directory is a git repo with go.mod
-		if hasGoMod(cmd.BaseDir) {
-			repos = append(repos, repo{
-				Path: cmd.BaseDir,
-				Name: filepath.Base(cmd.BaseDir),
-				Dir:  cmd.BaseDir,
-			})
-		}
-	}
-
-	return repos, err
-}
-
 func (cmd *fixCmd) fixRepo(repo repo) error {
 	fmt.Printf("\n=== Fixing %s ===\n", repo.Path)
 
-	if !hasGoMod(repo.Dir) {
+	modDirs := goModDirs(repo.Dir)
+	if len(modDirs) == 0 {
 		fmt.Println("No go.mod, skipping")
 		return nil
 	}
@@ -519,10 +411,12 @@ func (cmd *fixCmd) fixRepo(repo repo) error {
 		return fmt.Errorf("%s: failed to pull: %w", repo.Path, err)
 	}
 
-	// Run modernize -fix
-	fmt.Println("Running modernize -fix...")
-	if err := goRun(repo.Dir, "run", "golang.org/x/tools/go/analysis/passes/modernize/cmd/modernize@latest", "-fix", "./..."); err != nil {
-		return fmt.Errorf("%s: modernize failed: %w", repo.Path, err)
+	// Run modernize -fix in each module dir
+	for _, dir := range modDirs {
+		fmt.Printf("Running modernize -fix in %s...\n", dir)
+		if err := goRun(dir, "run", "golang.org/x/tools/go/analysis/passes/modernize/cmd/modernize@latest", "-fix", "./..."); err != nil {
+			return fmt.Errorf("%s: modernize failed: %w", repo.Path, err)
+		}
 	}
 
 	// Check for changes
@@ -612,6 +506,65 @@ func (cmd *fixCmd) createPR(repoDir, defaultBranch, branchName, commitMsg, prBod
 
 // --- Helpers ---
 
+// findRepos collects repos from all gitjoin.txt files under baseDir. If none
+// are found, it falls back to baseDir itself if it contains Go modules.
+func findRepos(baseDir string) ([]repo, error) {
+	var repos []repo
+
+	err := filepath.WalkDir(baseDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+
+		if d.IsDir() && d.Name() == ".git" {
+			return filepath.SkipDir
+		}
+
+		if d.Name() != "gitjoin.txt" {
+			return nil
+		}
+
+		gitjoinDir := filepath.Dir(path)
+		lines, err := readLines(path)
+		if err != nil {
+			return fmt.Errorf("failed to read %s: %w", path, err)
+		}
+
+		for _, line := range lines {
+			repoPath := repoPathFromGitjoinLine(line)
+			if repoPath == "" {
+				continue
+			}
+			repoName := repoNameFromPath(repoPath)
+			if repoName == "" {
+				continue
+			}
+			repoDir := filepath.Join(gitjoinDir, repoName)
+			if !dirExists(repoDir) {
+				fmt.Printf("Skipping %s: not cloned at %s\n", repoPath, repoDir)
+				continue
+			}
+			repos = append(repos, repo{
+				Path: repoPath,
+				Name: repoName,
+				Dir:  repoDir,
+			})
+		}
+
+		return nil
+	})
+
+	if len(repos) == 0 && len(goModDirs(baseDir)) > 0 {
+		repos = append(repos, repo{
+			Path: baseDir,
+			Name: filepath.Base(baseDir),
+			Dir:  baseDir,
+		})
+	}
+
+	return repos, err
+}
+
 // repoPathFromGitjoinLine extracts the GitHub repo path from a gitjoin.txt line.
 // Input: "github.com/bep/firstupdotenv" -> Output: "bep/firstupdotenv"
 func repoPathFromGitjoinLine(line string) string {
@@ -700,11 +653,17 @@ func goRun(dir string, args ...string) error {
 }
 
 func goModChanged(repoDir string) bool {
-	output, err := gitOutput(repoDir, "status", "--porcelain", "go.mod", "go.sum")
-	if err != nil {
-		return false
+	for _, dir := range goModDirs(repoDir) {
+		rel, err := filepath.Rel(repoDir, dir)
+		if err != nil {
+			continue
+		}
+		output, err := gitOutput(repoDir, "status", "--porcelain", filepath.Join(rel, "go.mod"), filepath.Join(rel, "go.sum"))
+		if err == nil && strings.TrimSpace(output) != "" {
+			return true
+		}
 	}
-	return strings.TrimSpace(output) != ""
+	return false
 }
 
 func testYmlChanged(repoDir string) bool {
@@ -794,6 +753,28 @@ func hasWorkflowsDir(repoDir string) bool {
 
 func hasGoMod(repoDir string) bool {
 	return fileExists(filepath.Join(repoDir, "go.mod"))
+}
+
+// goModDirs returns the directories to run Go commands in: the repo root if it
+// has a go.mod, else any non-hidden top-level directories that do.
+func goModDirs(repoDir string) []string {
+	if hasGoMod(repoDir) {
+		return []string{repoDir}
+	}
+	entries, err := os.ReadDir(repoDir)
+	if err != nil {
+		return nil
+	}
+	var dirs []string
+	for _, e := range entries {
+		if !e.IsDir() || strings.HasPrefix(e.Name(), ".") {
+			continue
+		}
+		if dir := filepath.Join(repoDir, e.Name()); hasGoMod(dir) {
+			dirs = append(dirs, dir)
+		}
+	}
+	return dirs
 }
 
 func fatalf(format string, args ...any) {
